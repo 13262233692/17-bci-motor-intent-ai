@@ -17,6 +17,7 @@ from app.signal.csp import (
 )
 from app.models.eeg_cnn import build_model
 from app.core.config import BCIConfig
+from app.xai.explainer import BCIExplainer, XAIOutputFormatter
 
 
 class MotorImageryInferenceEngine:
@@ -68,6 +69,10 @@ class MotorImageryInferenceEngine:
         self._nan_occurrences: int = 0
         self._preprocessing_stats: Dict[str, Any] = {}
 
+        self._explainer: Optional[BCIExplainer] = None
+        self._last_xai_result: Optional[Dict[str, Any]] = None
+        self._xai_enabled: bool = True
+
     def initialize(self) -> None:
         """初始化推理引擎的所有组件"""
         if self.config.highpass.enabled:
@@ -112,6 +117,15 @@ class MotorImageryInferenceEngine:
 
         self._model.eval()
         self._model.to(self.config.model.device)
+
+        if self._xai_enabled:
+            self._explainer = BCIExplainer(
+                model=self._model,
+                csp_filters=self._csp.filters_,
+                csp_patterns=self._csp.patterns_ if hasattr(self._csp, 'patterns_') else None,
+                device=self.config.model.device,
+                num_channels=self.config.signal.num_channels,
+            )
 
         self._initialized = True
 
@@ -484,6 +498,8 @@ class MotorImageryInferenceEngine:
             "highpass_enabled": self.config.highpass.enabled,
             "robust_preprocessing": self.config.numerical_stability.enable_robust_preprocessing,
             "last_preprocessing": self._preprocessing_stats,
+            "xai_enabled": self.xai_enabled,
+            "has_last_xai": self._last_xai_result is not None,
         }
 
     def reset(self) -> None:
@@ -496,6 +512,158 @@ class MotorImageryInferenceEngine:
         self._total_inferences = 0
         self._nan_occurrences = 0
         self._preprocessing_stats = {}
+        self._last_xai_result = None
+
+    def explain(self, force: bool = False) -> Optional[Dict[str, Any]]:
+        """
+        执行推理并返回完整的可解释性分析结果
+        
+        Args:
+            force: 是否强制执行，忽略最小间隔限制
+            
+        Returns:
+            包含控制指令和XAI分析结果的字典，如果数据不足返回None
+        """
+        if not self._initialized:
+            raise RuntimeError("引擎尚未初始化，请先调用 initialize()")
+
+        with self._inference_lock:
+            current_time = time.time()
+            min_interval = self.config.inference.min_inference_interval_ms / 1000.0
+
+            if not force and (current_time - self._last_inference_time) < min_interval:
+                if self._last_xai_result is not None:
+                    return self._last_xai_result
+                return None
+
+            window_data = self._buffer.await_window()
+            if window_data is None:
+                return None
+
+            self._total_inferences += 1
+
+            processed, preprocess_status = self._preprocess(window_data)
+            self._preprocessing_stats = preprocess_status
+
+            pred_class, confidence, probs, inference_stats = self._inference(processed)
+
+            smoothed_class, smoothed_conf = self._smooth_decision(
+                pred_class, confidence
+            )
+
+            command = self._generate_command(
+                smoothed_class,
+                smoothed_conf,
+                probs,
+                preprocess_status,
+                inference_stats,
+            )
+
+            xai_result = None
+            if self._explainer is not None:
+                try:
+                    xai_start = time.time()
+                    xai_analysis = self._explainer.explain(
+                        csp_processed_input=processed,
+                        target_class=None,
+                        class_names=self.config.inference.class_names,
+                    )
+                    xai_time_ms = (time.time() - xai_start) * 1000
+
+                    xai_result = XAIOutputFormatter.to_api_response(xai_analysis)
+                    xai_result["xai_computation_time_ms"] = xai_time_ms
+                except Exception as e:
+                    xai_result = {
+                        "error": str(e),
+                        "has_spatial_heatmap": False,
+                        "prediction": command,
+                    }
+
+            result = {
+                "command": command,
+                "xai": xai_result,
+                "timestamp": time.time(),
+            }
+
+            self._last_inference_time = current_time
+            self._last_command = command
+            self._last_xai_result = result
+
+            return result
+
+    def explain_latched(self) -> Optional[Dict[str, Any]]:
+        """
+        使用锁存窗口执行推理并返回XAI分析结果
+        
+        Returns:
+            包含控制指令和XAI分析结果的字典
+        """
+        if not self._initialized:
+            raise RuntimeError("引擎尚未初始化，请先调用 initialize()")
+
+        with self._inference_lock:
+            if not self._buffer.latch_window():
+                return None
+
+            window_data = self._buffer.get_window_and_clear()
+            if window_data is None:
+                return None
+
+            self._total_inferences += 1
+
+            processed, preprocess_status = self._preprocess(window_data)
+            self._preprocessing_stats = preprocess_status
+
+            pred_class, confidence, probs, inference_stats = self._inference(processed)
+            smoothed_class, smoothed_conf = self._smooth_decision(pred_class, confidence)
+            command = self._generate_command(
+                smoothed_class,
+                smoothed_conf,
+                probs,
+                preprocess_status,
+                inference_stats,
+            )
+
+            xai_result = None
+            if self._explainer is not None:
+                try:
+                    xai_start = time.time()
+                    xai_analysis = self._explainer.explain(
+                        csp_processed_input=processed,
+                        target_class=None,
+                        class_names=self.config.inference.class_names,
+                    )
+                    xai_time_ms = (time.time() - xai_start) * 1000
+
+                    xai_result = XAIOutputFormatter.to_api_response(xai_analysis)
+                    xai_result["xai_computation_time_ms"] = xai_time_ms
+                except Exception as e:
+                    xai_result = {
+                        "error": str(e),
+                        "has_spatial_heatmap": False,
+                        "prediction": command,
+                    }
+
+            result = {
+                "command": command,
+                "xai": xai_result,
+                "timestamp": time.time(),
+            }
+
+            self._last_inference_time = time.time()
+            self._last_command = command
+            self._last_xai_result = result
+
+            return result
+
+    def get_last_xai(self) -> Optional[Dict[str, Any]]:
+        """获取最近一次XAI分析结果"""
+        return self._last_xai_result
+
+    @property
+    def xai_enabled(self) -> bool:
+        """XAI功能是否启用"""
+        return self._xai_enabled and self._explainer is not None
 
     @property
     def buffer(self) -> LatchedSignalBuffer:

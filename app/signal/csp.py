@@ -70,7 +70,7 @@ class CSP:
         ])
 
         self.filters_ = spatial_filters[:, select_idx].T
-        self.patterns_ = linalg.pinv(spatial_filters[:, select_idx])
+        self.patterns_ = linalg.pinv(self.filters_)
 
         return self
 
