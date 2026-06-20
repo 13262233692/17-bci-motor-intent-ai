@@ -204,6 +204,51 @@ class CSP:
         return csp
 
 
+class HighPassFilter:
+    """
+    高通滤波器 - 用于消除基线漂移
+    
+    移除低于截止频率的信号成分，有效消除：
+    - 电极极化导致的直流偏移
+    - 患者出汗引起的缓慢基线漂移
+    - 运动伪迹产生的超低频干扰
+    
+    通常使用0.5-1Hz的截止频率
+    """
+
+    def __init__(
+        self,
+        cutoff_freq: float = 1.0,
+        sampling_rate: int = 250,
+        order: int = 4,
+    ):
+        self.cutoff_freq = cutoff_freq
+        self.sampling_rate = sampling_rate
+        self.order = order
+
+        nyquist = sampling_rate / 2.0
+        cutoff = cutoff_freq / nyquist
+
+        from scipy.signal import butter, filtfilt
+        self._butter = butter
+        self._filtfilt = filtfilt
+
+        self.b, self.a = butter(order, cutoff, btype="high")
+
+    def apply(self, X: np.ndarray, axis: int = -1) -> np.ndarray:
+        """
+        应用高通滤波
+        
+        Args:
+            X: EEG数据
+            axis: 滤波的轴，默认为最后一个轴（时间轴）
+            
+        Returns:
+            滤波后的数据，已消除基线漂移
+        """
+        return self._filtfilt(self.b, self.a, X, axis=axis)
+
+
 class BandPassFilter:
     """
     带通滤波器 - 使用FIR滤波器实现
@@ -270,3 +315,213 @@ def normalize_signal(signal: np.ndarray, method: str = "zscore") -> np.ndarray:
         return (signal - min_val) / (max_val - min_val)
     else:
         raise ValueError(f"未知的归一化方法: {method}")
+
+
+def check_numerical_stability(signal: np.ndarray) -> dict:
+    """
+    检查信号的数值稳定性
+    
+    Args:
+        signal: 输入信号
+        
+    Returns:
+        包含稳定性指标的字典
+    """
+    result = {
+        "has_nan": bool(np.any(np.isnan(signal))),
+        "has_inf": bool(np.any(np.isinf(signal))),
+        "max_value": float(np.max(np.abs(signal))) if signal.size > 0 else 0.0,
+        "min_value": float(np.min(signal)) if signal.size > 0 else 0.0,
+        "mean_value": float(np.mean(signal)) if signal.size > 0 else 0.0,
+        "std_value": float(np.std(signal)) if signal.size > 0 else 0.0,
+        "is_stable": True,
+        "issues": [],
+    }
+
+    if result["has_nan"]:
+        result["is_stable"] = False
+        result["issues"].append("NaN values detected")
+
+    if result["has_inf"]:
+        result["is_stable"] = False
+        result["issues"].append("Inf values detected")
+
+    if result["max_value"] > 1e6:
+        result["is_stable"] = False
+        result["issues"].append(f"Extreme values detected: max={result['max_value']:.2e}")
+
+    if result["std_value"] < 1e-10:
+        result["is_stable"] = False
+        result["issues"].append("Near-constant signal detected")
+
+    return result
+
+
+def remove_dc_offset(signal: np.ndarray) -> np.ndarray:
+    """
+    移除信号的直流偏移（简单的去均值）
+    
+    Args:
+        signal: 输入信号，形状为 (n_channels, n_samples)
+        
+    Returns:
+        去除直流偏移后的信号
+    """
+    mean = np.mean(signal, axis=-1, keepdims=True)
+    return signal - mean
+
+
+def clip_extreme_values(
+    signal: np.ndarray,
+    std_multiplier: float = 10.0,
+) -> np.ndarray:
+    """
+    截断极端值，防止算术溢出
+    
+    Args:
+        signal: 输入信号
+        std_multiplier: 标准差倍数，超过此阈值的值将被截断
+        
+    Returns:
+        截断后的信号
+    """
+    mean = np.mean(signal, axis=-1, keepdims=True)
+    std = np.std(signal, axis=-1, keepdims=True) + 1e-8
+
+    upper_bound = mean + std_multiplier * std
+    lower_bound = mean - std_multiplier * std
+
+    return np.clip(signal, lower_bound, upper_bound)
+
+
+def detect_baseline_drift(
+    signal: np.ndarray,
+    window_size: int = 100,
+    threshold: float = 50.0,
+) -> dict:
+    """
+    检测基线漂移
+    
+    Args:
+        signal: 输入信号，形状为 (n_channels, n_samples)
+        window_size: 滑动窗口大小（样本数）
+        threshold: 漂移阈值（微伏）
+        
+    Returns:
+        漂移检测结果
+    """
+    n_channels, n_samples = signal.shape
+
+    if n_samples < window_size:
+        return {
+            "has_drift": False,
+            "drift_magnitude": 0.0,
+            "max_drift_channel": -1,
+            "details": "Insufficient samples",
+        }
+
+    drift_magnitudes = np.zeros(n_channels)
+
+    for ch in range(n_channels):
+        moving_avg = np.convolve(
+            signal[ch],
+            np.ones(window_size) / window_size,
+            mode="valid",
+        )
+        drift_range = np.max(moving_avg) - np.min(moving_avg)
+        drift_magnitudes[ch] = drift_range
+
+    max_drift = np.max(drift_magnitudes)
+    max_drift_ch = np.argmax(drift_magnitudes)
+
+    return {
+        "has_drift": bool(max_drift > threshold),
+        "drift_magnitude": float(max_drift),
+        "max_drift_channel": int(max_drift_ch),
+        "channel_drifts": drift_magnitudes.tolist(),
+        "threshold": threshold,
+    }
+
+
+def robust_preprocessing_pipeline(
+    signal: np.ndarray,
+    highpass_filter: Optional[HighPassFilter] = None,
+    bandpass_filter: Optional[BandPassFilter] = None,
+    sampling_rate: int = 250,
+) -> tuple[np.ndarray, dict]:
+    """
+    鲁棒的预处理流水线 - 包含基线漂移检测与消除
+    
+    处理步骤：
+    1. 直流偏移移除
+    2. 极端值截断
+    3. 基线漂移检测
+    4. 高通滤波（消除基线漂移）
+    5. 带通滤波（Mu/Beta频段）
+    6. 数值稳定性检查
+    
+    Args:
+        signal: 原始EEG信号，形状为 (n_channels, n_samples)，单位为伏
+        highpass_filter: 可选的高通滤波器实例
+        bandpass_filter: 可选的带通滤波器实例
+        sampling_rate: 采样率
+        
+    Returns:
+        (处理后的信号, 处理状态字典)
+    """
+    status = {
+        "steps_completed": [],
+        "drift_detected": False,
+        "drift_magnitude": 0.0,
+        "numerical_stability": {},
+        "input_shape": signal.shape,
+        "output_shape": None,
+    }
+
+    signal = signal.astype(np.float64)
+    status["steps_completed"].append("type_conversion")
+
+    stability = check_numerical_stability(signal)
+    status["numerical_stability"]["input"] = stability
+
+    if not stability["is_stable"]:
+        if stability["has_nan"] or stability["has_inf"]:
+            signal = np.nan_to_num(signal, nan=0.0, posinf=1e6, neginf=-1e6)
+            status["steps_completed"].append("nan_inf_fix")
+
+        signal = remove_dc_offset(signal)
+        status["steps_completed"].append("dc_offset_removal")
+
+        signal = clip_extreme_values(signal, std_multiplier=10.0)
+        status["steps_completed"].append("extreme_value_clipping")
+
+    drift_info = detect_baseline_drift(signal * 1e6, threshold=50.0)
+    status["drift_detected"] = drift_info["has_drift"]
+    status["drift_magnitude"] = drift_info["drift_magnitude"]
+    status["drift_info"] = drift_info
+
+    if drift_info["has_drift"] or highpass_filter is not None:
+        if highpass_filter is None:
+            highpass_filter = HighPassFilter(
+                cutoff_freq=1.0,
+                sampling_rate=sampling_rate,
+                order=4,
+            )
+        signal = highpass_filter.apply(signal, axis=-1)
+        status["steps_completed"].append("highpass_filtering")
+
+    if bandpass_filter is not None:
+        signal = bandpass_filter.apply(signal, axis=-1)
+        status["steps_completed"].append("bandpass_filtering")
+
+    signal = normalize_signal(signal, method="zscore")
+    status["steps_completed"].append("normalization")
+
+    signal = clip_extreme_values(signal, std_multiplier=5.0)
+    status["steps_completed"].append("final_clipping")
+
+    stability_out = check_numerical_stability(signal)
+    status["numerical_stability"]["output"] = stability_out
+    status["output_shape"] = signal.shape
+
+    return signal, status

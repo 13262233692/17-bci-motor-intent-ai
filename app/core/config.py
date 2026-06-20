@@ -16,6 +16,14 @@ class SignalConfig:
 
 
 @dataclass
+class HighPassFilterConfig:
+    """高通滤波器配置 - 用于消除基线漂移"""
+    enabled: bool = True
+    cutoff_freq: float = 1.0
+    order: int = 4
+
+
+@dataclass
 class CSPConfig:
     """CSP特征提取配置"""
     n_components: int = 6
@@ -23,6 +31,17 @@ class CSPConfig:
     low_freq: float = 8.0
     high_freq: float = 30.0
     filter_order: int = 4
+
+
+@dataclass
+class NumericalStabilityConfig:
+    """数值稳定性配置"""
+    nan_detection: bool = True
+    inf_detection: bool = True
+    extreme_value_clip_std: float = 10.0
+    logit_clip_value: float = 20.0
+    drift_detection_threshold: float = 50.0
+    enable_robust_preprocessing: bool = True
 
 
 @dataclass
@@ -68,7 +87,9 @@ class APIConfig:
 class BCIConfig:
     """完整的BCI系统配置"""
     signal: SignalConfig = field(default_factory=SignalConfig)
+    highpass: HighPassFilterConfig = field(default_factory=HighPassFilterConfig)
     csp: CSPConfig = field(default_factory=CSPConfig)
+    numerical_stability: NumericalStabilityConfig = field(default_factory=NumericalStabilityConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     exoskeleton: ExoskeletonCommandConfig = field(default_factory=ExoskeletonCommandConfig)
